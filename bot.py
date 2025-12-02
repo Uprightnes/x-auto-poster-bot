@@ -1,10 +1,11 @@
-
 import tweepy
 import feedparser
+import requests
+from bs4 import BeautifulSoup
 import time
 import random
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 import json
 import re
 
@@ -18,56 +19,56 @@ ACCESS_TOKEN = os.getenv('ACCESS_TOKEN')
 ACCESS_TOKEN_SECRET = os.getenv('ACCESS_TOKEN_SECRET')
 
 SCHEDULE_FILE = 'scheduled_posts.json'
-LAST_RUN_FILE = 'last_scrape_date.txt'
 POSTED_URLS_FILE = 'posted_urls.json'
+DAILY_TRACKER_FILE = 'daily_post_count.json'
+
+# 🛑 SAFETY LIMIT (Total max posts per day)
+DAILY_LIMIT = 10 
+
+# ⏰ POSTING SCHEDULE (UTC TIMES)
+# Nigeria is UTC+1. So 7 UTC = 8 AM Nigeria.
+# These 10 slots spread the 10 posts throughout the day.
+ALLOWED_HOURS_UTC = [
+    7,   # 8 AM WAT (Morning Rush)
+    8,   # 9 AM WAT
+    10,  # 11 AM WAT
+    12,  # 1 PM WAT (Lunch)
+    14,  # 3 PM WAT
+    16,  # 5 PM WAT (Closing)
+    17,  # 6 PM WAT
+    19,  # 8 PM WAT (Evening Scroll)
+    20,  # 9 PM WAT
+    21   # 10 PM WAT (Late Night)
+]
 
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
 
-def load_schedule():
-    """Load scheduled posts from file"""
-    if os.path.exists(SCHEDULE_FILE):
-        with open(SCHEDULE_FILE, 'r') as f:
-            return json.load(f)
-    return []
+def load_json(filename):
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r') as f:
+                return json.load(f)
+        except:
+            return {} if filename == DAILY_TRACKER_FILE else []
+    return {} if filename == DAILY_TRACKER_FILE else []
 
-def save_schedule(posts):
-    """Save scheduled posts to file"""
-    with open(SCHEDULE_FILE, 'w') as f:
-        json.dump(posts, f, indent=2)
-
-def load_posted_urls():
-    """Load URLs that have been posted already"""
-    if os.path.exists(POSTED_URLS_FILE):
-        with open(POSTED_URLS_FILE, 'r') as f:
-            return json.load(f)
-    return []
+def save_json(filename, data):
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
 
 def save_posted_url(url):
-    """Save a URL as posted"""
-    posted = load_posted_urls()
-    if url not in posted:
-        posted.append(url)
-        # Keep only last 500 URLs
-        posted = posted[-500:]
-        with open(POSTED_URLS_FILE, 'w') as f:
-            json.dump(posted, f, indent=2)
-
-def get_last_scrape_date():
-    """Get the last date we scraped for jobs"""
-    if os.path.exists(LAST_RUN_FILE):
-        with open(LAST_RUN_FILE, 'r') as f:
-            return f.read().strip()
-    return None
-
-def set_last_scrape_date(date):
-    """Set the last scrape date"""
-    with open(LAST_RUN_FILE, 'w') as f:
-        f.write(date)
+    posted = load_json(POSTED_URLS_FILE)
+    if isinstance(posted, list):
+        if url not in posted:
+            posted.append(url)
+            posted = posted[-1000:]
+            save_json(POSTED_URLS_FILE, posted)
+    else:
+        save_json(POSTED_URLS_FILE, [url])
 
 def authenticate_twitter():
-    """Authenticate with X/Twitter API"""
     try:
         client = tweepy.Client(
             consumer_key=API_KEY,
@@ -82,347 +83,270 @@ def authenticate_twitter():
         return None
 
 # ============================================================================
-# RSS FEED SCRAPING (100% RELIABLE!)
+# CHECKERS: TIME & LIMITS
 # ============================================================================
 
-def get_jobs_via_rss():
-    """Get real Nigerian + international jobs via public RSS feeds"""
+def is_posting_hour():
+    """Checks if the current hour is in our allowed schedule"""
+    current_hour_utc = datetime.now(timezone.utc).hour
     
-    rss_feeds = [
-        # Nigerian Jobs
-        "https://www.jobberman.com/jobs/rss",
-        "https://www.myjobmag.com/rss/nigeria",
-        "https://ng.indeed.com/rss?q=&l=Nigeria",
-        "https://hotnigerianjobs.com/feed/",
+    if current_hour_utc in ALLOWED_HOURS_UTC:
+        print(f"✅ Current UTC Hour ({current_hour_utc}) is in allowed schedule.")
+        return True
+    else:
+        print(f"⏳ Current UTC Hour ({current_hour_utc}) is NOT in allowed schedule.")
+        print(f"   Allowed UTC hours: {ALLOWED_HOURS_UTC}")
+        print("   Script will run maintenance (scraping) but will NOT post.")
+        return False
+
+def check_daily_limit():
+    """Returns True if we are allowed to post, False if limit reached"""
+    tracker = load_json(DAILY_TRACKER_FILE)
+    
+    # Get current date (Nigeria is UTC+1)
+    nigeria_tz = timezone(timedelta(hours=1))
+    today_str = datetime.now(nigeria_tz).strftime('%Y-%m-%d')
+    
+    # Reset if new day
+    if not tracker or tracker.get('date') != today_str:
+        print(f"🔄 New day detected ({today_str}). Resetting counter to 0.")
+        tracker = {'date': today_str, 'count': 0}
+        save_json(DAILY_TRACKER_FILE, tracker)
+        return True
+    
+    current_count = tracker.get('count', 0)
+    print(f"📊 Daily Stats: {current_count}/{DAILY_LIMIT} posted today.")
+    
+    if current_count >= DAILY_LIMIT:
+        print("🛑 Daily limit reached! Skipping post.")
+        return False
         
-        # International Remote Jobs
-        "https://remoteok.com/remote-jobs.rss",
-        "https://weworkremotely.com/categories/remote-full-time-jobs.rss",
-        "https://rss.indeed.com/rss?q=remote",
+    return True
+
+def increment_daily_count():
+    tracker = load_json(DAILY_TRACKER_FILE)
+    nigeria_tz = timezone(timedelta(hours=1))
+    today_str = datetime.now(nigeria_tz).strftime('%Y-%m-%d')
+    
+    if tracker.get('date') != today_str:
+        tracker = {'date': today_str, 'count': 0}
+    
+    tracker['count'] = tracker.get('count', 0) + 1
+    save_json(DAILY_TRACKER_FILE, tracker)
+
+# ============================================================================
+# SMART DATA EXTRACTION (PRESERVED)
+# ============================================================================
+
+def extract_smart_details(html_text):
+    soup = BeautifulSoup(html_text, 'html.parser')
+    text = soup.get_text(separator=' ', strip=True)
+    
+    details = {'salary': None, 'email': None, 'benefits': []}
+    
+    # Salary
+    salary_patterns = [r'(\$|₦|N)\s?[\d,kK]+(\s*(-|—|to)\s*(\$|₦|N)\s?[\d,kK]+)?\s*(/yr|/mo|/year|/month|annually)?']
+    for pattern in salary_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            s = match.group(0).strip().replace('—', '-')
+            if len(s) > 3: details['salary'] = s; break
+    
+    # Email
+    emails = re.findall(r'[\w\.-]+@[\w\.-]+\.\w+', text)
+    ignore = ['noreply', 'support', 'help', 'info', 'example', 'wixpress']
+    for email in emails:
+        if not any(x in email.lower() for x in ignore):
+            details['email'] = email; break
+    
+    # Benefits
+    benefit_keywords = {
+        'Health': ['health insurance', 'medical', 'dental'],
+        'Remote': ['remote', 'work from home', 'wfh'],
+        'Visa': ['visa sponsorship', 'relocation'],
+        'Equity': ['stock options', 'equity', 'shares'],
+        'Flexible': ['flexible hours', 'async'],
+        'Vacation': ['unlimited pto', 'paid time off', 'vacation'],
+        'Crypto': ['crypto', 'bitcoin', 'web3']
+    }
+    found_benefits = []
+    text_lower = text.lower()
+    for label, patterns in benefit_keywords.items():
+        if any(p in text_lower for p in patterns):
+            found_benefits.append(label)
+            if len(found_benefits) >= 3: break
+    
+    details['benefits'] = found_benefits
+    return details
+
+# ============================================================================
+# RSS FEED SCRAPERS
+# ============================================================================
+
+def fetch_rss_jobs(feed_url, source_name, is_remote=False, country="Nigeria"):
+    jobs = []
+    print(f"📡 Fetching: {source_name}...")
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+        response = requests.get(feed_url, headers=headers, timeout=15)
+        feed = feedparser.parse(response.content)
         
-        # Scholarships
-        "https://www.scholarshipportal.com/rss/scholarships.xml",
-        "https://www.opportunitiesforafricans.com/feed/",
-        "https://www.scholars4dev.com/feed/",
-    ]
-    
-    all_opportunities = []
-    posted_urls = load_posted_urls()
-    
-    print("\n📡 Fetching opportunities from RSS feeds...")
+        if not feed.entries: return jobs
+        
+        posted_urls = load_json(POSTED_URLS_FILE)
+        if not isinstance(posted_urls, list): posted_urls = []
+        
+        for entry in feed.entries[:5]: # Top 5 per feed
+            try:
+                raw_html = ""
+                if hasattr(entry, 'content'): raw_html = entry.content[0].value
+                elif hasattr(entry, 'summary'): raw_html = entry.summary
+                elif hasattr(entry, 'description'): raw_html = entry.description
+                
+                job_url = entry.link.split('?')[0] if '?' in entry.link else entry.link
+                if job_url in posted_urls: continue
+                
+                details = extract_smart_details(raw_html)
+                
+                title_lower = entry.title.lower()
+                if 'lagos' in title_lower: location = 'Lagos 🇳🇬'
+                elif 'abuja' in title_lower: location = 'Abuja 🇳🇬'
+                elif is_remote: location = 'Remote 🌍'
+                else: location = f'{country} 🇳🇬'
+                
+                jobs.append({
+                    'title': entry.title.strip(),
+                    'url': job_url,
+                    'location': location,
+                    'salary': details['salary'],
+                    'email': details['email'],
+                    'benefits': details['benefits'],
+                    'type': 'job'
+                })
+            except: continue
+    except Exception as e:
+        print(f"  ✗ Error: {e}")
+    return jobs
+
+def scrape_scholarships():
+    scholarships = []
+    print("🎓 Fetching Scholarships...")
+    rss_feeds = ["https://www.opportunitiesforafricans.com/feed/", "https://www.scholars4dev.com/feed/"]
+    posted_urls = load_json(POSTED_URLS_FILE)
+    if not isinstance(posted_urls, list): posted_urls = []
     
     for feed_url in rss_feeds:
         try:
-            print(f"  → Checking: {feed_url.split('/')[2]}...")
             feed = feedparser.parse(feed_url)
-            
-            if not feed.entries:
-                print(f"    ⚠️ No entries found")
-                continue
-            
-            count = 0
-            for entry in feed.entries[:15]:  # Limit per feed
+            for entry in feed.entries[:3]:
                 try:
+                    job_url = entry.link.split('?')[0] if '?' in entry.link else entry.link
+                    if job_url in posted_urls: continue
+                    
                     title = entry.title.strip()
-                    link = entry.link.strip()
+                    if not any(w in title.lower() for w in ['scholarship', 'grant', 'funded']): continue
                     
-                    # Skip if already posted
-                    if link in posted_urls:
-                        continue
+                    year = datetime.now().year
+                    if str(year) not in title and str(year + 1) not in title: title = f"{title} {year + 1}"
+                    is_funded = 'fully funded' in title.lower()
                     
-                    # Skip duplicates in current batch
-                    if any(j.get('url') == link for j in all_opportunities):
-                        continue
-                    
-                    # Determine if it's a scholarship or job
-                    is_scholarship = any(word in title.lower() for word in ['scholarship', 'grant', 'study abroad', 'funded'])
-                    
-                    # Extract some basic info from title
-                    location = extract_location_from_title(title)
-                    work_type = extract_work_type_from_title(title)
-                    
-                    all_opportunities.append({
+                    scholarships.append({
                         'title': title,
-                        'url': link,
-                        'type': 'scholarship' if is_scholarship else 'job',
-                        'location': location,
-                        'work_type': work_type,
-                        'source': feed_url.split('/')[2]
+                        'url': job_url,
+                        'location': 'International 🌍',
+                        'salary': 'Fully Funded' if is_funded else 'Scholarship',
+                        'email': None,
+                        'benefits': ['Tuition', 'Stipend'] if is_funded else ['Education'],
+                        'type': 'scholarship'
                     })
-                    count += 1
-                    
-                except Exception as e:
-                    continue
-            
-            print(f"    ✓ Found {count} new opportunities")
-            time.sleep(1)  # Be respectful
-            
-        except Exception as e:
-            print(f"    ✗ Error: {e}")
-            continue
+                except: continue
+        except: continue
+    return scholarships
+
+# ============================================================================
+# MAIN LOGIC
+# ============================================================================
+
+def format_rich_tweet(item):
+    icon = '🎓' if item['type'] == 'scholarship' else '🔥'
+    title = item['title'][:70] + "..." if len(item['title']) > 70 else item['title']
+    tweet = f"{icon} {title}\n\n📍 {item['location']}"
+    if item['salary']: tweet += f" | 💰 {item['salary']}"
+    if item['benefits']: tweet += "\n" + " | ".join([f"✅ {b}" for b in item['benefits'][:3]])
+    tweet += "\n\n👉 APPLY:"
+    if item['email']: tweet += f"\n📧 {item['email']}"
+    tweet += f"\n🔗 {item['url']}"
+    
+    tags = []
+    if item['type'] == 'scholarship': tags = ['#Scholarships', '#StudyAbroad', '#FullyFunded']
+    elif 'Remote' in item['location']: tags = ['#RemoteJobs', '#TechJobs', '#Wfh']
+    else: tags = ['#NigeriaJobs', '#Lagos', '#JobSearch']
+    
+    tweet += f"\n\n{' '.join(tags)}"
+    return tweet
+
+def refill_queue():
+    print("\n🔍 Refilling Queue...")
+    all_opportunities = []
+    all_opportunities.extend(fetch_rss_jobs("https://remoteok.com/remote-jobs.rss", "RemoteOK", is_remote=True))
+    all_opportunities.extend(fetch_rss_jobs("https://hotnigerianjobs.com/feed/", "HotNigerianJobs", is_remote=False))
+    all_opportunities.extend(fetch_rss_jobs("https://www.myjobmag.com/feed", "MyJobMag", is_remote=False))
+    all_opportunities.extend(scrape_scholarships())
     
     random.shuffle(all_opportunities)
-    print(f"\n✅ Total: {len(all_opportunities)} fresh opportunities from RSS feeds!")
     
-    return all_opportunities[:15]  # Return top 15
-
-def extract_location_from_title(title):
-    """Try to extract location from job title"""
-    title_lower = title.lower()
-    
-    # Nigerian states
-    nigerian_states = ['lagos', 'abuja', 'port harcourt', 'kano', 'ibadan', 'kaduna', 'enugu']
-    for state in nigerian_states:
-        if state in title_lower:
-            return state.title()
-    
-    # Common keywords
-    if 'remote' in title_lower or 'worldwide' in title_lower:
-        return 'Remote/Worldwide'
-    if 'nigeria' in title_lower:
-        return 'Nigeria'
-    
-    return 'See Job Post'
-
-def extract_work_type_from_title(title):
-    """Try to extract work type from title"""
-    title_lower = title.lower()
-    
-    if 'remote' in title_lower:
-        return 'Remote'
-    if 'hybrid' in title_lower:
-        return 'Hybrid'
-    if 'onsite' in title_lower or 'on-site' in title_lower:
-        return 'Onsite'
-    
-    return 'See Details'
-
-# ============================================================================
-# FORMATTING FUNCTIONS
-# ============================================================================
-
-def format_job_tweet(job):
-    """Format job as tweet text"""
-    
-    # Basic format
-    tweet = f"🔥 {job['title']}\n\n"
-    
-    # Add location if available
-    if job.get('location') and job['location'] != 'See Job Post':
-        tweet += f"📍 Location: {job['location']}\n"
-    
-    # Add work type if available  
-    if job.get('work_type') and job['work_type'] != 'See Details':
-        tweet += f"💼 Type: {job['work_type']}\n"
-    
-    tweet += f"\n👉 APPLY HERE: {job['url']}"
-    
-    # Truncate if too long
-    if len(tweet) > 280:
-        max_title_length = 280 - len(job['url']) - 50
-        short_title = job['title'][:max_title_length] + "..."
-        tweet = f"🔥 {short_title}\n\n"
-        if job.get('location'):
-            tweet += f"📍 {job['location']}\n"
-        tweet += f"\n👉 APPLY: {job['url']}"
-    
-    return tweet
-
-def format_scholarship_tweet(scholarship):
-    """Format scholarship as tweet text"""
-    
-    year = datetime.now().year
-    title = scholarship['title']
-    
-    # Add year if not present
-    if str(year) not in title and str(year + 1) not in title:
-        title = f"{title} {year + 1}"
-    
-    tweet = f"🎓 {title}\n\n"
-    
-    # Check if it mentions funding
-    if any(word in title.lower() for word in ['fully funded', 'full scholarship', 'funded']):
-        tweet += "💰 Fully Funded\n"
-    
-    # Add location if available
-    if scholarship.get('location') and scholarship['location'] != 'See Job Post':
-        tweet += f"🌍 {scholarship['location']}\n"
-    
-    tweet += f"\n👉 APPLY HERE: {scholarship['url']}"
-    
-    # Truncate if too long
-    if len(tweet) > 280:
-        max_title_length = 280 - len(scholarship['url']) - 50
-        short_title = title[:max_title_length] + "..."
-        tweet = f"🎓 {short_title}\n\n"
-        tweet += f"👉 APPLY: {scholarship['url']}"
-    
-    return tweet
-
-# ============================================================================
-# SCHEDULING FUNCTIONS
-# ============================================================================
-
-def generate_posting_times(count=15):
-    """Generate posting times throughout the day (Nigeria WAT = UTC+1)"""
-    now = datetime.utcnow()
-    times = []
-    
-    # Posting times in UTC (these will be 1 hour later in Nigeria WAT)
-    # 6am UTC = 7am WAT, 8am UTC = 9am WAT, etc.
-    hours = [6, 8, 10, 12, 14, 16, 18, 20, 22]
-    
-    for i in range(min(count, len(hours))):
-        post_time = now.replace(hour=hours[i % len(hours)], minute=0, second=0, microsecond=0)
-        
-        # If the time has already passed today, schedule for next occurrence
-        if post_time < now:
-            post_time += timedelta(days=1)
-        
-        times.append(post_time.isoformat() + 'Z')
-    
-    # If we need more times, add some for tomorrow
-    while len(times) < count:
-        base_time = datetime.utcnow() + timedelta(days=1)
-        for hour in hours:
-            if len(times) >= count:
-                break
-            post_time = base_time.replace(hour=hour, minute=0, second=0, microsecond=0)
-            times.append(post_time.isoformat() + 'Z')
-    
-    return times[:count]
-
-def should_scrape_today():
-    """Check if we should scrape for new jobs today"""
-    last_scrape = get_last_scrape_date()
-    today = datetime.utcnow().strftime('%Y-%m-%d')
-    
-    # Scrape if we haven't scraped today OR if it's around 4-6am UTC (5-7am WAT)
-    current_hour = datetime.utcnow().hour
-    
-    if last_scrape != today and current_hour >= 4:
-        return True
-    
-    return False
-
-def scrape_and_schedule():
-    """Scrape opportunities via RSS and schedule them for posting"""
-    print("\n🔍 Starting RSS feed collection...")
-    
-    # Get opportunities from RSS feeds
-    all_opportunities = get_jobs_via_rss()
-    
-    if not all_opportunities:
-        print("⚠️ No new opportunities found")
-        return []
-    
-    print(f"\n📅 Scheduling {len(all_opportunities)} opportunities...")
-    
-    # Generate posting times
-    posting_times = generate_posting_times(len(all_opportunities))
-    
-    # Create scheduled posts
-    scheduled_posts = []
-    for i, opp in enumerate(all_opportunities):
-        if i >= len(posting_times):
-            break
-        
-        if opp['type'] == 'job':
-            tweet_text = format_job_tweet(opp)
-        elif opp['type'] == 'scholarship':
-            tweet_text = format_scholarship_tweet(opp)
-        else:
-            continue
-        
-        scheduled_posts.append({
-            'scheduled_time': posting_times[i],
-            'tweet_text': tweet_text,
-            'url': opp['url'],
-            'category': opp['type'],
-            'posted': False
-        })
-        
-        print(f"  ✓ Scheduled: {opp['title'][:60]}...")
-        print(f"    Post time: {posting_times[i]}")
-    
-    # Mark today as scraped
-    set_last_scrape_date(datetime.utcnow().strftime('%Y-%m-%d'))
-    
-    return scheduled_posts
-
-def post_due_tweets(client):
-    """Post tweets that are due now"""
-    schedule = load_schedule()
-    now = datetime.utcnow().isoformat() + 'Z'
-    
-    posted_count = 0
-    
-    for post in schedule:
-        if not post['posted'] and post['scheduled_time'] <= now:
-            try:
-                print(f"\n📤 Posting: {post['tweet_text'][:80]}...")
-                client.create_tweet(text=post['tweet_text'])
-                post['posted'] = True
-                save_posted_url(post['url'])
-                posted_count += 1
-                print(f"  ✓ Posted successfully!")
-                time.sleep(5)  # Small delay between posts
-            except Exception as e:
-                print(f"  ✗ Error posting: {e}")
-    
-    # Remove posted tweets from schedule
-    schedule = [p for p in schedule if not p['posted']]
-    save_schedule(schedule)
-    
-    return posted_count
-
-# ============================================================================
-# MAIN FUNCTION
-# ============================================================================
+    formatted_posts = []
+    for opp in all_opportunities:
+        formatted_posts.append({'tweet_text': format_rich_tweet(opp), 'url': opp['url']})
+    return formatted_posts
 
 def main():
-    """Main bot function"""
-    print(f"\n{'='*70}")
-    print(f"🤖 X Auto-Poster Bot - RSS Feed Edition")
-    print(f"⏰ Current time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    print(f"🇳🇬 Nigeria time: {(datetime.utcnow() + timedelta(hours=1)).strftime('%H:%M:%S')} WAT")
-    print(f"{'='*70}\n")
+    print(f"\n{'='*60}")
+    print(f"🤖 Smart Scheduler Bot")
+    print(f"⏰ UTC: {datetime.now(timezone.utc).strftime('%H:%M:%S')}")
+    print(f"{'='*60}\n")
     
-    # Authenticate with X
-    client = authenticate_twitter()
-    if not client:
-        print("✗ Cannot proceed without X authentication")
-        return
+    # 1. MAINTENANCE: Always refill queue if empty, even if not posting time
+    schedule = load_json(SCHEDULE_FILE)
+    if not isinstance(schedule, list): schedule = []
     
-    # Load existing schedule
-    schedule = load_schedule()
-    print(f"📋 Current schedule has {len(schedule)} pending posts")
-    
-    # Check if we should scrape today
-    if should_scrape_today():
-        print("\n🆕 Time to collect fresh opportunities from RSS feeds!")
-        new_posts = scrape_and_schedule()
-        schedule.extend(new_posts)
-        save_schedule(schedule)
-        print(f"\n✅ Added {len(new_posts)} new posts to schedule")
+    if len(schedule) == 0:
+        print("📭 Queue is empty! Scraping now to be ready for next slot...")
+        new_posts = refill_queue()
+        if new_posts:
+            schedule.extend(new_posts)
+            save_json(SCHEDULE_FILE, schedule)
+            print(f"✅ Queue refilled with {len(new_posts)} posts.")
     else:
-        print("\n⏭️ Already collected opportunities today, skipping")
-    
-    # Post any due tweets
-    print("\n📬 Checking for due posts...")
-    posted_count = post_due_tweets(client)
-    
-    if posted_count > 0:
-        print(f"\n🎉 Successfully posted {posted_count} tweet(s)!")
-    else:
-        print("\n⏳ No posts due right now")
-        if schedule:
-            next_post = min(schedule, key=lambda x: x['scheduled_time'])
-            print(f"📅 Next post scheduled for: {next_post['scheduled_time']}")
-    
-    print(f"\n{'='*70}")
-    print(f"✅ Bot run complete!")
-    print(f"{'='*70}\n")
+        print(f"📋 Queue has {len(schedule)} posts ready.")
+
+    # 2. CHECK: Is it time to post?
+    if not is_posting_hour():
+        return # Exit safely
+        
+    # 3. CHECK: Daily limit
+    if not check_daily_limit():
+        return # Exit safely
+
+    # 4. ACTION: Post Tweet
+    if schedule:
+        # Authenticate only when we actually need to post
+        client = authenticate_twitter()
+        if not client: return
+
+        post_to_publish = schedule[0]
+        try:
+            print(f"\n📤 Posting: {post_to_publish['tweet_text'][:50]}...")
+            client.create_tweet(text=post_to_publish['tweet_text'])
+            save_posted_url(post_to_publish['url'])
+            increment_daily_count()
+            schedule.pop(0)
+            save_json(SCHEDULE_FILE, schedule)
+            print("✅ Tweet sent successfully!")
+        except Exception as e:
+            print(f"❌ Error posting: {e}")
+            schedule.pop(0)
+            save_json(SCHEDULE_FILE, schedule)
 
 if __name__ == "__main__":
     main()
