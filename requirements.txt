@@ -1,2 +1,4 @@
 tweepy
 feedparser
+requests
+beautifulsoup4
