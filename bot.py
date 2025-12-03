@@ -329,24 +329,48 @@ def main():
         return # Exit safely
 
     # 4. ACTION: Post Tweet
+    # 4. ACTION: Post Tweet
     if schedule:
         # Authenticate only when we actually need to post
         client = authenticate_twitter()
         if not client: return
-
-        post_to_publish = schedule[0]
-        try:
-            print(f"\n📤 Posting: {post_to_publish['tweet_text'][:50]}...")
-            client.create_tweet(text=post_to_publish['tweet_text'])
-            save_posted_url(post_to_publish['url'])
-            increment_daily_count()
-            schedule.pop(0)
-            save_json(SCHEDULE_FILE, schedule)
-            print("✅ Tweet sent successfully!")
-        except Exception as e:
-            print(f"❌ Error posting: {e}")
-            schedule.pop(0)
-            save_json(SCHEDULE_FILE, schedule)
-
+    
+        # Find the next unposted item whose time has passed
+        current_time = datetime.now(timezone.utc)
+        post_to_publish = None
+        post_index = None
+        
+        for i, post in enumerate(schedule):
+            # Check if post has scheduled_time field
+            if 'scheduled_time' in post:
+                scheduled_time = datetime.fromisoformat(post['scheduled_time'].replace('Z', '+00:00'))
+                if not post.get('posted', False) and current_time >= scheduled_time:
+                    post_to_publish = post
+                    post_index = i
+                    break
+            else:
+                # Old format without scheduled_time
+                if not post.get('posted', False):
+                    post_to_publish = post
+                    post_index = i
+                    break
+        
+        if post_to_publish:
+            try:
+                print(f"\n📤 Posting: {post_to_publish['tweet_text'][:50]}...")
+                client.create_tweet(text=post_to_publish['tweet_text'])
+                save_posted_url(post_to_publish['url'])
+                increment_daily_count()
+                
+                # Mark as posted instead of removing
+                schedule[post_index]['posted'] = True
+                save_json(SCHEDULE_FILE, schedule)
+                print("✅ Tweet sent successfully!")
+            except Exception as e:
+                print(f"❌ Error posting: {e}")
+                schedule[post_index]['posted'] = True
+                save_json(SCHEDULE_FILE, schedule)
+        else:
+            print("⏰ No posts ready to publish yet (checking scheduled times)")
 if __name__ == "__main__":
     main()
