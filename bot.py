@@ -63,7 +63,9 @@ def save_posted_url(url):
     if isinstance(posted, list):
         if url not in posted:
             posted.append(url)
-            posted = posted[-1000:]
+            # Keep only last 500 URLs to prevent file from getting too large
+            if len(posted) > 500:
+                posted = posted[-500:]
             save_json(POSTED_URLS_FILE, posted)
     else:
         save_json(POSTED_URLS_FILE, [url])
@@ -81,6 +83,59 @@ def authenticate_twitter():
     except Exception as e:
         print(f"✗ Authentication failed: {e}")
         return None
+
+# ============================================================================
+# DAILY CLEANUP & DATA MANAGEMENT
+# ============================================================================
+
+def cleanup_old_data():
+    """Clean up old data when it's a new day"""
+    tracker = load_json(DAILY_TRACKER_FILE)
+    
+    # Get Nigeria time (UTC+1)
+    nigeria_tz = timezone(timedelta(hours=1))
+    today_str = datetime.now(nigeria_tz).strftime('%Y-%m-%d')
+    
+    # If it's a new day, clean up everything
+    if not tracker or tracker.get('date') != today_str:
+        print(f"🆕 NEW DAY DETECTED: {today_str}")
+        print("🧹 Cleaning up old data...")
+        
+        # 1. Reset daily tracker
+        tracker = {'date': today_str, 'count': 0}
+        save_json(DAILY_TRACKER_FILE, tracker)
+        
+        # 2. Clear scheduled posts (keep only unposted items from today)
+        schedule = load_json(SCHEDULE_FILE)
+        if isinstance(schedule, list):
+            # Remove old scheduled posts (keep only from today or unposted)
+            cleaned_schedule = []
+            for post in schedule:
+                # If post has a scheduled_time, check if it's from today
+                if 'scheduled_time' in post:
+                    try:
+                        post_time = datetime.fromisoformat(post['scheduled_time'].replace('Z', '+00:00'))
+                        if post_time.date() == datetime.now(timezone.utc).date():
+                            cleaned_schedule.append(post)
+                    except:
+                        continue
+                # If no scheduled_time, keep only if not posted
+                elif not post.get('posted', False):
+                    cleaned_schedule.append(post)
+            
+            save_json(SCHEDULE_FILE, cleaned_schedule)
+            print(f"  ✓ Scheduled posts: {len(schedule)} → {len(cleaned_schedule)}")
+        
+        # 3. Trim posted URLs list (keep last 500)
+        posted_urls = load_json(POSTED_URLS_FILE)
+        if isinstance(posted_urls, list) and len(posted_urls) > 500:
+            posted_urls = posted_urls[-500:]
+            save_json(POSTED_URLS_FILE, posted_urls)
+            print(f"  ✓ Posted URLs trimmed to {len(posted_urls)}")
+        
+        print("✅ New day cleanup completed!")
+    
+    return tracker
 
 # ============================================================================
 # CHECKERS: TIME & LIMITS
@@ -103,7 +158,7 @@ def check_daily_limit():
     """Returns True if we are allowed to post, False if limit reached"""
     tracker = load_json(DAILY_TRACKER_FILE)
     
-    # Get current date (Nigeria is UTC+1)
+    # Get Nigeria time (UTC+1)
     nigeria_tz = timezone(timedelta(hours=1))
     today_str = datetime.now(nigeria_tz).strftime('%Y-%m-%d')
     
@@ -124,15 +179,21 @@ def check_daily_limit():
     return True
 
 def increment_daily_count():
+    """Increment the daily post count"""
     tracker = load_json(DAILY_TRACKER_FILE)
+    
+    # Get Nigeria time (UTC+1)
     nigeria_tz = timezone(timedelta(hours=1))
     today_str = datetime.now(nigeria_tz).strftime('%Y-%m-%d')
     
-    if tracker.get('date') != today_str:
-        tracker = {'date': today_str, 'count': 0}
+    # Reset if it's a new day
+    if not tracker or tracker.get('date') != today_str:
+        tracker = {'date': today_str, 'count': 1}
+    else:
+        tracker['count'] = tracker.get('count', 0) + 1
     
-    tracker['count'] = tracker.get('count', 0) + 1
     save_json(DAILY_TRACKER_FILE, tracker)
+    print(f"📈 Incremented daily count to {tracker['count']}")
 
 # ============================================================================
 # SMART DATA EXTRACTION (PRESERVED)
@@ -264,7 +325,7 @@ def scrape_scholarships():
     return scholarships
 
 # ============================================================================
-# MAIN LOGIC
+# QUEUE MANAGEMENT
 # ============================================================================
 
 def format_rich_tweet(item):
@@ -286,6 +347,7 @@ def format_rich_tweet(item):
     return tweet
 
 def refill_queue():
+    """Scrape new opportunities and add them to queue"""
     print("\n🔍 Refilling Queue...")
     all_opportunities = []
     all_opportunities.extend(fetch_rss_jobs("https://remoteok.com/remote-jobs.rss", "RemoteOK", is_remote=True))
@@ -296,81 +358,124 @@ def refill_queue():
     random.shuffle(all_opportunities)
     
     formatted_posts = []
-    for opp in all_opportunities:
-        formatted_posts.append({'tweet_text': format_rich_tweet(opp), 'url': opp['url']})
+    for opp in all_opportunities[:10]:  # Limit to 10 new posts
+        # Add scheduled time for the next posting hour
+        current_utc = datetime.now(timezone.utc)
+        current_hour = current_utc.hour
+        
+        # Find next allowed hour
+        next_hour = None
+        for hour in ALLOWED_HOURS_UTC:
+            if hour > current_hour:
+                next_hour = hour
+                break
+        
+        # If no more hours today, use first hour tomorrow
+        if next_hour is None:
+            next_hour = ALLOWED_HOURS_UTC[0]
+            scheduled_time = current_utc.replace(hour=next_hour, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        else:
+            scheduled_time = current_utc.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+        
+        formatted_posts.append({
+            'tweet_text': format_rich_tweet(opp),
+            'url': opp['url'],
+            'posted': False,
+            'scheduled_time': scheduled_time.isoformat(),
+            'added_at': current_utc.isoformat()
+        })
+    
     return formatted_posts
+
+# ============================================================================
+# MAIN LOGIC
+# ============================================================================
 
 def main():
     print(f"\n{'='*60}")
     print(f"🤖 Smart Scheduler Bot")
     print(f"⏰ UTC: {datetime.now(timezone.utc).strftime('%H:%M:%S')}")
+    
+    # Get Nigeria time
+    nigeria_tz = timezone(timedelta(hours=1))
+    nigeria_time = datetime.now(nigeria_tz).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"🇳🇬 Nigeria: {nigeria_time}")
     print(f"{'='*60}\n")
     
-    # 1. MAINTENANCE: Always refill queue if empty, even if not posting time
-    schedule = load_json(SCHEDULE_FILE)
-    if not isinstance(schedule, list): schedule = []
+    # 0. FIRST: Clean up old data if it's a new day
+    tracker = cleanup_old_data()
     
-    if len(schedule) == 0:
-        print("📭 Queue is empty! Scraping now to be ready for next slot...")
+    # 1. MAINTENANCE: Always refill queue if low
+    schedule = load_json(SCHEDULE_FILE)
+    if not isinstance(schedule, list): 
+        schedule = []
+    
+    print(f"📊 Daily Stats: {tracker.get('count', 0)}/{DAILY_LIMIT} posts today")
+    print(f"📋 Queue: {len(schedule)} scheduled posts")
+    
+    if len(schedule) < 5:  # Refill if queue is getting low
+        print("📭 Queue is low! Scraping new opportunities...")
         new_posts = refill_queue()
         if new_posts:
             schedule.extend(new_posts)
             save_json(SCHEDULE_FILE, schedule)
-            print(f"✅ Queue refilled with {len(new_posts)} posts.")
-    else:
-        print(f"📋 Queue has {len(schedule)} posts ready.")
-
+            print(f"✅ Added {len(new_posts)} new posts to queue.")
+    
     # 2. CHECK: Is it time to post?
     if not is_posting_hour():
-        return # Exit safely
-        
+        print("⏳ Not a posting hour. Maintenance complete.")
+        return
+    
     # 3. CHECK: Daily limit
     if not check_daily_limit():
-        return # Exit safely
-
-    # 4. ACTION: Post Tweet
+        return
+    
     # 4. ACTION: Post Tweet
     if schedule:
         # Authenticate only when we actually need to post
         client = authenticate_twitter()
-        if not client: return
+        if not client: 
+            return
     
-        # Find the next unposted item whose time has passed
-        current_time = datetime.now(timezone.utc)
+        # Find the next unposted item
         post_to_publish = None
         post_index = None
         
         for i, post in enumerate(schedule):
-            # Check if post has scheduled_time field
-            if 'scheduled_time' in post:
-                scheduled_time = datetime.fromisoformat(post['scheduled_time'].replace('Z', '+00:00'))
-                if not post.get('posted', False) and current_time >= scheduled_time:
-                    post_to_publish = post
-                    post_index = i
-                    break
-            else:
-                # Old format without scheduled_time
-                if not post.get('posted', False):
-                    post_to_publish = post
-                    post_index = i
-                    break
+            if not post.get('posted', False):
+                post_to_publish = post
+                post_index = i
+                break
         
         if post_to_publish:
             try:
                 print(f"\n📤 Posting: {post_to_publish['tweet_text'][:50]}...")
-                client.create_tweet(text=post_to_publish['tweet_text'])
+                print(f"📅 Today's date: {datetime.now(nigeria_tz).strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                response = client.create_tweet(text=post_to_publish['tweet_text'])
                 save_posted_url(post_to_publish['url'])
                 increment_daily_count()
                 
-                # Mark as posted instead of removing
+                # Mark as posted with timestamp
                 schedule[post_index]['posted'] = True
+                schedule[post_index]['posted_at'] = datetime.now(timezone.utc).isoformat()
                 save_json(SCHEDULE_FILE, schedule)
+                
+                # Verify increment worked
+                updated_tracker = load_json(DAILY_TRACKER_FILE)
+                print(f"📊 New daily count: {updated_tracker.get('count', 0)}/{DAILY_LIMIT}")
+                print(f"📎 URL: {post_to_publish['url']}")
                 print("✅ Tweet sent successfully!")
+                
             except Exception as e:
                 print(f"❌ Error posting: {e}")
-                schedule[post_index]['posted'] = True
-                save_json(SCHEDULE_FILE, schedule)
+                # Don't mark as posted if there was an error
         else:
-            print("⏰ No posts ready to publish yet (checking scheduled times)")
+            print("📭 No unposted items in queue.")
+            # Clean up all posted items to make room for new ones
+            unposted_posts = [p for p in schedule if not p.get('posted', False)]
+            save_json(SCHEDULE_FILE, unposted_posts)
+            print(f"🧹 Cleaned queue: {len(schedule)} → {len(unposted_posts)} posts")
+
 if __name__ == "__main__":
     main()
