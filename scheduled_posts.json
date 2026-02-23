@@ -34,8 +34,9 @@
   {
     "tweet_text": "\ud83d\udd25 \n\n\ud83d\udccd Remote \ud83c\udf0d\n\n\ud83d\udc49 APPLY:\n\ud83d\udd17 https://remoteOK.com/remote-jobs/remote-1130494\n\n#RemoteJobs #TechJobs #Wfh",
     "url": "https://remoteOK.com/remote-jobs/remote-1130494",
-    "posted": false,
+    "posted": true,
     "scheduled_time": "2026-02-23T07:00:00+00:00",
-    "added_at": "2026-02-22T23:32:05.511908+00:00"
+    "added_at": "2026-02-22T23:32:05.511908+00:00",
+    "posted_at": "2026-02-23T17:04:56.315513+00:00"
   }
 ]
