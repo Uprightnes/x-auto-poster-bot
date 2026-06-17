@@ -25,6 +25,10 @@ DAILY_TRACKER_FILE = 'daily_post_count.json'
 # 🛑 SAFETY LIMIT (Total max posts per day)
 DAILY_LIMIT = 10 
 
+# 🕐 FRESHNESS LIMIT — drop unposted items older than this many hours
+# This is what actually guarantees "latest update only" — not the calendar date.
+MAX_QUEUE_AGE_HOURS = 36
+
 # ⏰ POSTING SCHEDULE (UTC TIMES)
 # Nigeria is UTC+1. So 7 UTC = 8 AM Nigeria.
 # These 10 slots spread the 10 posts throughout the day.
@@ -89,44 +93,70 @@ def authenticate_twitter():
 # ============================================================================
 
 def cleanup_old_data():
-    """Clean up old data when it's a new day"""
+    """Clean up old data when it's a new day.
+
+    IMPORTANT: Freshness of queued posts is judged by `added_at` (when the
+    item was actually scraped), NOT by whether `scheduled_time` happens to
+    fall on today's calendar date. The old logic deleted perfectly fresh,
+    still-unposted items just because UTC midnight had passed since they
+    were queued. Now a post only gets dropped once it's actually stale
+    (older than MAX_QUEUE_AGE_HOURS), regardless of which day it is.
+    """
     tracker = load_json(DAILY_TRACKER_FILE)
     
     # Get Nigeria time (UTC+1)
     nigeria_tz = timezone(timedelta(hours=1))
     today_str = datetime.now(nigeria_tz).strftime('%Y-%m-%d')
     
-    # If it's a new day, clean up everything
-    if not tracker or tracker.get('date') != today_str:
+    is_new_day = (not tracker or tracker.get('date') != today_str)
+
+    if is_new_day:
         print(f"🆕 NEW DAY DETECTED: {today_str}")
         print("🧹 Cleaning up old data...")
         
         # 1. Reset daily tracker
         tracker = {'date': today_str, 'count': 0}
         save_json(DAILY_TRACKER_FILE, tracker)
-        
-        # 2. Clear scheduled posts (keep only unposted items from today)
-        schedule = load_json(SCHEDULE_FILE)
-        if isinstance(schedule, list):
-            # Remove old scheduled posts (keep only from today or unposted)
-            cleaned_schedule = []
-            for post in schedule:
-                # If post has a scheduled_time, check if it's from today
-                if 'scheduled_time' in post:
-                    try:
-                        post_time = datetime.fromisoformat(post['scheduled_time'].replace('Z', '+00:00'))
-                        if post_time.date() == datetime.now(timezone.utc).date():
-                            cleaned_schedule.append(post)
-                    except:
+
+    # 2. Prune the schedule by FRESHNESS, every run (not just on day change).
+    #    - Already-posted items are dropped (no longer needed).
+    #    - Unposted items older than MAX_QUEUE_AGE_HOURS are dropped (stale).
+    #    - Everything else survives, even across a day boundary.
+    schedule = load_json(SCHEDULE_FILE)
+    if isinstance(schedule, list):
+        now_utc = datetime.now(timezone.utc)
+        cleaned_schedule = []
+        dropped_stale = 0
+        dropped_posted = 0
+
+        for post in schedule:
+            if post.get('posted', False):
+                dropped_posted += 1
+                continue
+
+            added_at_str = post.get('added_at')
+            if added_at_str:
+                try:
+                    added_at = datetime.fromisoformat(added_at_str.replace('Z', '+00:00'))
+                    age_hours = (now_utc - added_at).total_seconds() / 3600
+                    if age_hours > MAX_QUEUE_AGE_HOURS:
+                        dropped_stale += 1
                         continue
-                # If no scheduled_time, keep only if not posted
-                elif not post.get('posted', False):
-                    cleaned_schedule.append(post)
-            
+                except Exception:
+                    # If we can't parse it, don't silently keep junk forever —
+                    # but don't nuke it on a parse hiccup either. Keep it once;
+                    # it'll get judged again next run.
+                    pass
+
+            cleaned_schedule.append(post)
+
+        if len(cleaned_schedule) != len(schedule):
             save_json(SCHEDULE_FILE, cleaned_schedule)
-            print(f"  ✓ Scheduled posts: {len(schedule)} → {len(cleaned_schedule)}")
-        
-        # 3. Trim posted URLs list (keep last 500)
+            print(f"  ✓ Scheduled posts: {len(schedule)} → {len(cleaned_schedule)} "
+                  f"(dropped {dropped_posted} posted, {dropped_stale} stale >{MAX_QUEUE_AGE_HOURS}h)")
+
+    # 3. Trim posted URLs list (keep last 500) — only needs to happen once a day
+    if is_new_day:
         posted_urls = load_json(POSTED_URLS_FILE)
         if isinstance(posted_urls, list) and len(posted_urls) > 500:
             posted_urls = posted_urls[-500:]
@@ -346,8 +376,13 @@ def format_rich_tweet(item):
     tweet += f"\n\n{' '.join(tags)}"
     return tweet
 
-def refill_queue():
-    """Scrape new opportunities and add them to queue"""
+def refill_queue(schedule):
+    """Scrape new opportunities and add them to queue.
+
+    Posts are spread across the REMAINING allowed hours today (and overflow
+    to tomorrow's hours if there are more posts than remaining slots), so a
+    refill doesn't bunch everything into a single timestamp.
+    """
     print("\n🔍 Refilling Queue...")
     all_opportunities = []
     all_opportunities.extend(fetch_rss_jobs("https://remoteok.com/remote-jobs.rss", "RemoteOK", is_remote=True))
@@ -356,27 +391,46 @@ def refill_queue():
     all_opportunities.extend(scrape_scholarships())
     
     random.shuffle(all_opportunities)
-    
+
+    current_utc = datetime.now(timezone.utc)
+    current_hour = current_utc.hour
+
+    # Hours still ahead of us today
+    remaining_today = [h for h in ALLOWED_HOURS_UTC if h > current_hour]
+
+    # Already-used slots (today or future) so we don't double-book a slot
+    # that an earlier, still-unposted item already occupies.
+    used_slots = set()
+    for p in schedule:
+        if not p.get('posted', False) and p.get('scheduled_time'):
+            try:
+                used_slots.add(p['scheduled_time'])
+            except Exception:
+                pass
+
     formatted_posts = []
-    for opp in all_opportunities[:10]:  # Limit to 10 new posts
-        # Add scheduled time for the next posting hour
-        current_utc = datetime.now(timezone.utc)
-        current_hour = current_utc.hour
-        
-        # Find next allowed hour
-        next_hour = None
-        for hour in ALLOWED_HOURS_UTC:
-            if hour > current_hour:
-                next_hour = hour
+    day_offset = 0
+    hour_pool = list(remaining_today) if remaining_today else []
+
+    for opp in all_opportunities[:10]:  # Limit to 10 new posts per refill
+        scheduled_time = None
+        # Walk forward through hour_pool / next days until we find a free slot
+        while True:
+            if not hour_pool:
+                day_offset += 1
+                hour_pool = list(ALLOWED_HOURS_UTC)
+
+            hour = hour_pool.pop(0)
+            candidate_date = current_utc + timedelta(days=day_offset)
+            candidate = candidate_date.replace(hour=hour, minute=0, second=0, microsecond=0)
+            candidate_iso = candidate.isoformat()
+
+            if candidate_iso not in used_slots:
+                scheduled_time = candidate
+                used_slots.add(candidate_iso)
                 break
-        
-        # If no more hours today, use first hour tomorrow
-        if next_hour is None:
-            next_hour = ALLOWED_HOURS_UTC[0]
-            scheduled_time = current_utc.replace(hour=next_hour, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        else:
-            scheduled_time = current_utc.replace(hour=next_hour, minute=0, second=0, microsecond=0)
-        
+            # else: slot taken, loop again and pull the next hour
+
         formatted_posts.append({
             'tweet_text': format_rich_tweet(opp),
             'url': opp['url'],
@@ -402,7 +456,7 @@ def main():
     print(f"🇳🇬 Nigeria: {nigeria_time}")
     print(f"{'='*60}\n")
     
-    # 0. FIRST: Clean up old data if it's a new day
+    # 0. FIRST: Clean up stale/posted data (freshness-based, not date-based)
     tracker = cleanup_old_data()
     
     # 1. MAINTENANCE: Always refill queue if low
@@ -415,7 +469,7 @@ def main():
     
     if len(schedule) < 5:  # Refill if queue is getting low
         print("📭 Queue is low! Scraping new opportunities...")
-        new_posts = refill_queue()
+        new_posts = refill_queue(schedule)
         if new_posts:
             schedule.extend(new_posts)
             save_json(SCHEDULE_FILE, schedule)
